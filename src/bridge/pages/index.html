@@ -11,6 +11,8 @@
     header { padding: 14px 18px; border-bottom: 1px solid #1f2937; display: flex; align-items: center; gap: 10px; }
     header h1 { font-size: 15px; font-weight: 600; margin: 0; }
     .badge { font-size: 10px; padding: 2px 6px; border-radius: 999px; background: #14b8a6; color: #fff; }
+    .status { font-size: 12px; color: #14b8a6; margin-left: auto; }
+    .status.err { color: #f87171; }
     main { padding: 18px; display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
     section { border: 1px solid #1f2937; border-radius: 10px; padding: 14px; background: #0f1525; }
@@ -22,11 +24,16 @@
     button:hover { background: #111827f0; }
     button.primary { background: #16a34a; border-color: #16a34a; color: #fff; }
     .row { display: flex; gap: 8px; align-items: center; }
-    .status { font-size: 12px; color: #14b8a6; }
-    .err { color: #f87171; }
+    .tab { padding: 8px; border: 1px solid #1f2937; border-radius: 8px; margin: 4px 0; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+    .tab:hover { background: #111827; }
+    .tab.active { border-color: #14b8a6; background: #0f1525; }
+    .login-badge { font-size: 10px; padding: 2px 6px; border-radius: 999px; margin-left: auto; }
+    .login-badge.in { background: #16a34a; color: #fff; }
+    .login-badge.out { background: #b91c1c; color: #fff; }
+    .login-badge.unknown { background: #4b5563; color: #fff; }
     .img { max-width: 100%; border-radius: 8px; border: 1px solid #1f2937; background: #000; }
-    details { border: 1px solid #1f2937; border-radius: 8px; padding: 10px; }
-    summary { color: #e5e7eb; cursor: pointer; }
+    .log { max-height: 200px; overflow-y: auto; }
+    .pill { font-size: 11px; padding: 2px 6px; border-radius: 6px; background: #1f2937; }
   </style>
 </head>
 <body>
@@ -34,8 +41,16 @@
     <h1>Hermes Browser Bridge</h1>
     <span class="badge">v0.1</span>
     <span id="status" class="status">connecting…</span>
+    <div class="row">
+      <button id="btnDetectAll" class="pill">Detect logins</button>
+      <button id="btnRefreshTabs" class="pill">Refresh tabs</button>
+    </div>
   </header>
   <main>
+    <section>
+      <h2>Tabs</h2>
+      <div id="tabs"><div style="color:#6b7280;font-size:12px;">Loading…</div></div>
+    </section>
     <section>
       <h2>Visibility</h2>
       <label>URL</label>
@@ -60,17 +75,17 @@
         <option value="evaluate">Evaluate JS</option>
         <option value="scroll">Scroll</option>
       </select>
-      <label>Selector / expression</label>
+      <label>Selector / expression / value</label>
       <input id="selector" placeholder="a[href], body, #app" />
-      <label>Value (for type/text)</label>
-      <input id="value" placeholder="hello world or button=yes" />
+      <label>Value (for type/scroll)</label>
+      <input id="value" placeholder="optional" />
       <button id="btnRun">Run</button>
       <pre id="result" style="background:#0b1020; padding:8px; border-radius:8px; overflow:auto; max-height:220px; font-size:12px; color:#c7d2fe;"></pre>
     </section>
 
     <section style="grid-column: 1 / -1;">
       <h2>Console</h2>
-      <textarea id="log" readonly style="min-height: 180px;"></textarea>
+      <textarea id="log" readonly class="log" style="min-height: 180px;"></textarea>
     </section>
   </main>
 
@@ -86,7 +101,13 @@
       document.getElementById('status').textContent = 'connected';
       log({ type: 'connected' });
     });
-    ws.addEventListener('message', (e) => log(JSON.parse(e.data)));
+    ws.addEventListener('message', (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'login_state' || msg.type === 'tab_update' || msg.type === 'tab_activated') {
+        renderTabs();
+      }
+      log(msg);
+    });
     ws.addEventListener('close', () => {
       document.getElementById('status').className = 'status err';
       document.getElementById('status').textContent = 'disconnected';
@@ -96,6 +117,44 @@
       const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
       return r.status === 204 ? null : r.json();
     }
+
+    async function renderTabs() {
+      const container = document.getElementById('tabs');
+      try {
+        const data = await fetch('/tabs').then(r => r.json());
+        const tabs = data.tabs || [];
+        if (!tabs.length) { container.innerHTML = '<div style="color:#6b7280;font-size:12px;">No tabs reported yet.</div>'; return; }
+        container.innerHTML = tabs.map(t => {
+          const login = t.loginState || {};
+          const badge = login.logged_out ? 'out' : (login.logged_in ? 'in' : 'unknown');
+          const label = login.logged_out ? 'logged out' : (login.logged_in ? 'logged in' : 'unknown');
+          const active = t.active ? 'active' : '';
+          return `<div class="tab ${active}" data-tab="${t.tabId}">
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${t.title || 'Untitled'}</div>
+              <div style="font-size:11px;color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${t.url || ''}</div>
+            </div>
+            <span class="login-badge ${badge}">${label}</span>
+          </div>`;
+        }).join('');
+        container.querySelectorAll('.tab').forEach(el => {
+          el.addEventListener('click', async () => {
+            const tabId = Number(el.dataset.tab);
+            await api(`/tabs/${tabId}/activate`);
+            log({ type: 'activate', tabId });
+          });
+        });
+      } catch (e) {
+        container.innerHTML = `<div style="color:#f87171;font-size:12px;">${String(e)}</div>`;
+      }
+    }
+
+    document.getElementById('btnRefreshTabs').addEventListener('click', () => renderTabs());
+    document.getElementById('btnDetectAll').addEventListener('click', async () => {
+      await api('/tabs/login-states');
+      log({ type: 'detect_all' });
+      setTimeout(renderTabs, 1500);
+    });
 
     document.getElementById('btnScreenshot').addEventListener('click', async () => {
       const data = await api('/screenshot', { url: document.getElementById('url').value, width: 1280, height: 800 });
@@ -109,7 +168,7 @@
         document.getElementById('previewText').style.display = 'block';
         document.getElementById('preview').style.display = 'none';
       }
-      log({ type: 'screenshot', size: data?.dataUrl?.length });
+      log({ type: 'screenshot' });
     });
 
     document.getElementById('btnSummarize').addEventListener('click', async () => {

@@ -12,9 +12,18 @@ app.use(express.static(path.join(__dirname, 'pages')));
 const CDP_ENDPOINT = process.env.CDP_ENDPOINT || null;
 const USE_CDP = !!CDP_ENDPOINT;
 
+let browser = null;
 let cdpClient = null;
 let cdpTargetId = null;
 let wsClients = new Set();
+
+// Track tab meta we learn from the extension
+const remoteTabs = new Map(); // tabId -> { url, title, active, loginState, lastSeen }
+
+function upsertRemoteTab(update) {
+  const prev = remoteTabs.get(update.tabId) || {};
+  remoteTabs.set(update.tabId, { ...prev, ...update, lastSeen: Date.now() });
+}
 
 async function getBrowser() {
   if (browser && browser.isConnected()) return browser;
@@ -32,7 +41,7 @@ async function getCDP() {
     ws.on('error', reject);
     setTimeout(() => reject(new Error('CDP connect timeout')), 15000);
   });
-  // Try to fetch target list
+  ws.close();
   const http = require('http');
   const targets = await new Promise((resolve, reject) => {
     http.get(new URL('/json/list', CDP_ENDPOINT).toString(), (res) => {
@@ -56,8 +65,8 @@ async function getCDP() {
 
 async function cdpSend(method, params = {}) {
   const client = await getCDP();
-  const id = 1;
   return new Promise((resolve, reject) => {
+    const id = 1;
     const handler = (raw) => {
       const msg = JSON.parse(raw.toString());
       if (msg.id === id) {
@@ -71,30 +80,6 @@ async function cdpSend(method, params = {}) {
     setTimeout(() => { client.off('message', handler); reject(new Error('cdp timeout: ' + method)); }, 20000);
   });
 }
-async function renderPage({ url, width = 1280, height = 800, fullPage = false }) {
-  if (USE_CDP) {
-    const client = await getCDP();
-    await cdpSend('Page.navigate', { url });
-    await new Promise(r => setTimeout(r, 1500));
-    const clip = fullPage ? null : { x: 0, y: 0, width, height, scale: 1 };
-    const { data } = await cdpSend('Page.captureScreenshot', { format: 'png', clip });
-    return data; // base64 string
-  }
-  const b = await getBrowser();
-  const page = await b.newPage({ viewport: { width, height } });
-  await page.setExtraHTTPHeaders({ 'user-agent': 'Mozilla/5.0 (compatible; Hermes Browser Bridge)' });
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    // Give SPA shells time to paint
-    await page.waitForTimeout(1500);
-    const buffer = await page.screenshot({ fullPage, type: 'png' });
-    await page.close();
-    return buffer.toString('base64');
-  } catch (e) {
-    await page.close();
-    throw e;
-  }
-}
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
@@ -103,7 +88,48 @@ function json(obj, status = 200) {
 // Health
 app.get('/health', async () => json({ ok: true, service: 'hermes-browser-bridge', time: new Date().toISOString() }));
 
-// Screenshot endpoint
+// Multi-tab orchestration: list tabs known to the extension
+app.get('/tabs', async (req, res) => {
+  const useExtension = req.query.source !== 'cdp';
+  if (USE_CDP && !useExtension) {
+    try {
+      const http = require('http');
+      const targets = await new Promise((resolve, reject) => {
+        http.get(new URL('/json/list', CDP_ENDPOINT).toString(), (res) => {
+          let body = '';
+          res.on('data', (chunk) => (body += chunk));
+          res.on('end', () => resolve(JSON.parse(body)));
+        }).on('error', reject);
+      });
+      return res.json({ source: 'cdp', tabs: targets.map(t => ({ id: t.id, url: t.url, title: t.title, type: t.type })) });
+    } catch (e) {
+      return res.json({ source: 'cdp', error: String(e) });
+    }
+  }
+  // Fallback to extension-reported tabs
+  const tabs = [];
+  remoteTabs.forEach((meta, tabId) => tabs.push({ tabId, ...meta }));
+  tabs.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  res.json({ source: 'extension', tabs });
+});
+
+// Switch / activate a specific tab (proxied to extension via event bus)
+app.post('/tabs/:tabId/activate', async (req, res) => {
+  const { tabId } = req.params;
+  broadcastToWS({ type: 'switch_tab', tabId: Number(tabId) });
+  res.json({ queued: true, tabId: Number(tabId) });
+});
+
+// Login state detection via extension
+app.post('/tabs/login-states', async (req, res) => {
+  broadcastToWS({ type: 'detect_all_login_states' });
+  // Return extension-known states immediately; live updates arrive via WS
+  const states = [];
+  remoteTabs.forEach((meta, tabId) => states.push({ tabId, ...meta }));
+  res.json({ queued: true, states });
+});
+
+// Screenshot
 app.post('/screenshot', async (req, res) => {
   const { url, width, height, fullPage } = req.body || {};
   if (!url) return json({ error: 'url required' }, 400);
@@ -115,7 +141,7 @@ app.post('/screenshot', async (req, res) => {
   }
 });
 
-// Light page summary: title + text + links
+// Page summary
 app.post('/summarize', async (req, res) => {
   const { url, width } = req.body || {};
   if (!url) return json({ error: 'url required' }, 400);
@@ -124,8 +150,6 @@ app.post('/summarize', async (req, res) => {
       const client = await getCDP();
       await cdpSend('Page.navigate', { url: String(url) });
       await new Promise(r => setTimeout(r, 1500));
-      const { root } = await cdpSend('DOM.getDocument', { depth: 2 });
-      const { outerHTML } = await cdpSend('DOM.getOuterHTML', { nodeId: root.nodeId });
       const js = `(() => ({ title: document.title, url: document.location.href, text: document.body?.innerText?.slice(0, 4000), links: Array.from(document.querySelectorAll('a')).slice(0, 40).map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.getAttribute('href') })) }))()`;
       const { result } = await cdpSend('Runtime.evaluate', { expression: js, returnByValue: true });
       return json(result.value);
@@ -150,8 +174,7 @@ app.post('/summarize', async (req, res) => {
   }
 });
 
-// Lightweight browser control – sends simulated input to the local Chromium instance
-// Connect to an existing Chrome via CDP and start proxying agent control to it.
+// CDP connect
 app.post('/cdp/connect', async (req, res) => {
   const { endpoint } = req.body || {};
   if (!endpoint) return json({ error: 'endpoint required (http://127.0.0.1:9222)' }, 400);
@@ -160,14 +183,15 @@ app.post('/cdp/connect', async (req, res) => {
   return json({ mode: 'cdp', connected: true, targetId: cdpTargetId });
 });
 
+// Control routed by extension (requires extension-connected host)
 app.post('/control', async (req, res) => {
-  const { action, selector, url, text, x, y } = req.body || {};
+  // When running headless, use Playwright as before
   const b = browser || (await getBrowser());
   const context = await b.contexts().catch(() => null);
   const pages = context?.pages?.() || [];
-  // Prefer a visible tab when available, else create one
   let page = pages.find(p => !p.isClosed());
   if (!page) page = await getBrowser().then(b => b.newPage());
+  const { action, selector, url, text, x, y } = req.body || {};
   if (url) {
     await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     await page.waitForTimeout(1200);
@@ -204,16 +228,37 @@ app.post('/control', async (req, res) => {
   }
 });
 
+// Events coming from extension (tab updates, login states)
 app.post('/event', (req, res) => {
-  const msg = { id: uuidv4(), ...req.body, receivedAt: new Date().toISOString() };
-  const payload = JSON.stringify(msg);
+  const payload = req.body || {};
+  if (payload.type === 'tab_update' && payload.tabId) {
+    upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: false });
+  }
+  if (payload.type === 'tab_activated' && payload.tabId) {
+    upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: true });
+  }
+  if (payload.type === 'tab_removed' && payload.tabId) {
+    remoteTabs.delete(payload.tabId);
+  }
+  if (payload.type === 'login_state' && payload.tabId) {
+    upsertRemoteTab({ tabId: payload.tabId, loginState: payload.loginState });
+  }
+  const msg = { id: uuidv4(), ...payload, receivedAt: new Date().toISOString() };
+  const raw = JSON.stringify(msg);
   wsClients.forEach((ws) => {
-    if (ws.readyState === 1) ws.send(payload);
+    if (ws.readyState === 1) ws.send(raw);
   });
   res.status(202).json({ queued: wsClients.size });
 });
 
-// Agent-friendly transport
+// Push commands from bridge to extension via WS
+function broadcastToWS(msg) {
+  const raw = JSON.stringify({ ...msg, _bridge: true });
+  wsClients.forEach((ws) => {
+    if (ws.readyState === 1) ws.send(raw);
+  });
+}
+
 const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`[hermes-browser-bridge] HTTP + WS on http://127.0.0.1:${PORT}`);
 });
@@ -227,11 +272,9 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     const msg = raw.toString();
     const id = uuidv4();
-    // fan to everyone except sender
     wsClients.forEach((client) => {
       if (client !== ws && client.readyState === 1) client.send(JSON.stringify({ id, from: 'ws', body: msg }));
     });
-    // minimal echo confirming receipt
     ws.send(JSON.stringify({ id, ok: true, bytes: Buffer.byteLength(msg) }));
   });
 });
