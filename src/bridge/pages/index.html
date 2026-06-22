@@ -50,6 +50,25 @@
     <section>
       <h2>Tabs</h2>
       <div id="tabs"><div style="color:#6b7280;font-size:12px;">Loading…</div></div>
+    <div style="margin-top:12px;">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <button id="btnNewGroup" class="pill">Group selected</button>
+        <input id="groupTitle" placeholder="Group title" style="width:140px;" />
+        <select id="groupColor" style="width:110px;">
+          <option value="grey">Grey</option>
+          <option value="blue">Blue</option>
+          <option value="red">Red</option>
+          <option value="yellow">Yellow</option>
+          <option value="green">Green</option>
+          <option value="pink">Pink</option>
+          <option value="purple">Purple</option>
+          <option value="cyan">Cyan</option>
+          <option value="orange">Orange</option>
+        </select>
+        <button id="btnRefreshGroups" class="pill">Refresh</button>
+      </div>
+      <div id="groups" style="margin-top:8px;"></div>
+    </div>
     </section>
     <section>
       <h2>Visibility</h2>
@@ -191,6 +210,27 @@
       const data = await api('/control', payload);
       document.getElementById('result').textContent = JSON.stringify(data, null, 2);
       log({ type: 'control', payload, data });
+    });
+
+    async function renderGroups() {
+      const container = document.getElementById('groups');
+      try {
+        const data = await fetch('/groups').then(r => r.json());
+        container.innerHTML = '<div style="color:#6b7280;font-size:12px;">Pending… check console.</div>';
+        log({ type: 'list_groups', queued: data.queued });
+      } catch (e) {
+        container.innerHTML = `<div style="color:#f87171;font-size:12px;">${String(e)}</div>`;
+      }
+    }
+
+    document.getElementById('btnRefreshGroups').addEventListener('click', renderGroups);
+    document.getElementById('btnNewGroup').addEventListener('click', async () => {
+      const title = document.getElementById('groupTitle').value;
+      const color = document.getElementById('groupColor').value;
+      const checked = Array.from(document.querySelectorAll('#tabs .tab')).filter(el => el.querySelector('input[type="checkbox"]')?.checked).map(el => Number(el.dataset.tab));
+      const data = await api('/groups', { action: 'create_group', title, color, tabIds: checked.length ? checked : undefined });
+      log({ type: 'create_group', data });
+      renderGroups();
     });
   </script>
 </body>

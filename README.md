@@ -10,17 +10,10 @@ Chrome extension + local bridge that lets any agent (Hermes, Claude Code, etc.) 
 - Run arbitrary JS in-page
 - Connect to your real running Chrome via CDP for live-tab control
 - Login state detection across all tabs (logged in / logged out / unknown)
+- OAuth session sharing — read auth cookies and storage tokens (CDP mode)
 - Multi-tab orchestration: list, switch, close, create, batch-command across tabs
+- Tab groups: create, rename, recolor, collapse, add/remove tabs
 - Communicate via Chrome native messaging or localhost HTTP/WebSocket
-
-## Modes
-
-| Mode | How | Best for |
-|------|-----|----------|
-| **Headless** | Bridge launches its own Chromium | Private page renders, screenshots |
-| **CDP** | Bridge attaches to an existing Chrome via `--remote-debugging-port` | Control your real browser tabs with login state intact |
-
-CDP keeps your session cookies and logged-in state available to the agent.
 
 ## Download & install
 
@@ -59,6 +52,7 @@ You’ll see:
 - Live tab list with login badges
 - Screenshot and summarize tools
 - Agent control panel
+- Tab group controls
 - Live event console
 
 ### 5. Register native messaging (Windows, optional)
@@ -71,7 +65,7 @@ node scripts/register-native-host.js
 
 Restart Chrome after running it.
 
-### 6. Use CDP mode with your real browser (optional but powerful)
+### 6. Use CDP mode with your real browser (recommended for session access)
 
 Close all Chrome windows completely, then restart with remote debugging:
 
@@ -81,19 +75,20 @@ chrome.exe --remote-debugging-port=9222
 
 Then, from the dashboard or extension popup, connect to `http://127.0.0.1:9222`.
 
+CDP mode is required for:
+- Reading all cookies (including HttpOnly)
+- OAuth session sharing
+- Controlling your real browser with login state intact
+
 ## Quick test
 
 ```bash
-# Health
 curl http://127.0.0.1:8765/health
-
-# List tabs (requires extension loaded)
 curl http://127.0.0.1:8765/tabs
-
-# Detect login states across all tabs (requires extension loaded)
 curl -X POST http://127.0.0.1:8765/tabs/login-states
-
-# Headless screenshot
+curl -X GET http://127.0.0.1:8765/groups
+curl -X GET http://127.0.0.1:8765/sessions
+curl -X POST http://127.0.0.1:8765/sessions/123
 curl -X POST http://127.0.0.1:8765/screenshot -H 'content-type: application/json' -d '{"url":"https://example.com"}'
 ```
 
@@ -108,18 +103,30 @@ Base URL: `http://127.0.0.1:8765`
 | `/tabs` | GET | `?source=extension\|cdp` | Array of tabs with `tabId`, `url`, `title`, `loginState` |
 | `/tabs/:tabId/activate` | POST | — | Queued switch command |
 | `/tabs/login-states` | POST | — | Triggers detection across all extension-reported tabs |
+| `/groups` | GET | — | Queued list of tab groups |
+| `/groups` | POST | `{ action, title?, color?, tabIds?, groupId? }` | Create/update/delete groups |
+| `/sessions` | GET | — | Queued list of all OAuth sessions (CDP mode) |
+| `/sessions/:tabId` | POST | — | Queued session token scan for a specific tab |
 
 ### Control actions (via `/control` or extension proxy)
 
 | Action | Params | Returns |
 |--------|--------|---------|
 | `list_tabs` | — | `{ tabs: [{ id, url, title, active, loginState }] }` |
+| `list_groups` | — | `{ groups: [{ id, title, color, collapsed, tabIds }] }` |
+| `create_group` | `tabIds?`, `title?`, `color?` | `{ created, groupId }` |
+| `update_group` | `groupId`, `title?`, `color?`, `collapsed?` | `{ updated, groupId }` |
+| `add_to_group` | `groupId`, `tabIds` | `{ added, groupId }` |
+| `remove_from_group` | `tabIds` | `{ removed }` |
+| `delete_group` | `groupId` | `{ deleted, groupId }` |
 | `switch_tab` | `tabId` | `{ switched, tabId, url, title }` |
 | `close_tab` | `tabId` | `{ closed, tabId }` |
 | `new_tab` | `url?` | `{ created, tabId }` |
 | `batch_command` | `commands[]`, `targetTabIds?` | `{ executed, results }` |
 | `detect_login_state` | `tabId` | `{ tabId, loginState }` |
 | `detect_all_login_states` | — | `{ detections }` |
+| `get_session_tokens` | `tabId` | `{ tabId, authCookies, storageTokens }` (CDP only) |
+| `get_all_sessions` | — | `{ sessions }` (CDP only) |
 | `get_url` | — | `{ url }` |
 | `get_title` | — | `{ title }` |
 | `get_html` | — | HTML string |
@@ -141,17 +148,28 @@ The extension runs `detectLoginState()` in every tab and reports results back to
 - Logged-in UI elements: avatars, profile links, settings routes
 - URL route patterns: `/login`, `/signin`, `/signup`, `/forgot-password`
 
-Result shape:
-```json
-{
-  "logged_out": true,
-  "confidence": "high",
-  "reason": "password_field_present",
-  "indicators": ["ui:{...}", "token_keys:[]"],
-  "url": "...",
-  "hostname": "..."
-}
-```
+## OAuth session sharing (CDP mode)
+
+When the bridge is connected to CDP (`--remote-debugging-port=9222`), the agent can:
+
+- `GET /sessions` — list all domains with active auth cookies
+- `POST /sessions/:tabId` — get auth cookies + storage tokens for a specific tab
+- See cookie metadata: `httpOnly`, `secure`, `domain`, `expires`
+- See storage token keys and length (values are not exposed for security)
+
+This lets the agent know _where_ you’re logged in, and in some cases reuse session cookies for API calls. HttpOnly cookies are readable only via CDP, not from page JS.
+
+## Tab groups
+
+Chrome tab groups are supported via the extension:
+
+- `list_groups` — enumerate all groups with their tabs
+- `create_group` — group selected tabs, or create a new tab in a group
+- `update_group` — rename, recolor, collapse/expand
+- `add_to_group` / `remove_from_group` — move tabs in/out
+- `delete_group` — ungroup all tabs and dissolve
+
+Colors: `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`.
 
 ## Architecture
 
@@ -159,7 +177,7 @@ Result shape:
 Chrome ↔ Extension ↔ (native pipe / localhost) ↔ Bridge ↔ Playwright / CDP ↔ Agent (HTTP/WS)
 ```
 
-- **Extension** surfaces current tab state, forwards commands, detects login state across tabs.
+- **Extension** surfaces current tab state, forwards commands, detects login state, manages tab groups.
 - **Bridge** renders pages, controls Chromium headless, or attaches via CDP to your real browser.
 - **Agent** talks over REST/WebSocket.
 

@@ -17,8 +17,7 @@ let cdpClient = null;
 let cdpTargetId = null;
 let wsClients = new Set();
 
-// Track tab meta we learn from the extension
-const remoteTabs = new Map(); // tabId -> { url, title, active, loginState, lastSeen }
+const remoteTabs = new Map();
 
 function upsertRemoteTab(update) {
   const prev = remoteTabs.get(update.tabId) || {};
@@ -85,10 +84,8 @@ function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-// Health
 app.get('/health', async () => json({ ok: true, service: 'hermes-browser-bridge', time: new Date().toISOString() }));
 
-// Multi-tab orchestration: list tabs known to the extension
 app.get('/tabs', async (req, res) => {
   const useExtension = req.query.source !== 'cdp';
   if (USE_CDP && !useExtension) {
@@ -106,30 +103,49 @@ app.get('/tabs', async (req, res) => {
       return res.json({ source: 'cdp', error: String(e) });
     }
   }
-  // Fallback to extension-reported tabs
   const tabs = [];
   remoteTabs.forEach((meta, tabId) => tabs.push({ tabId, ...meta }));
   tabs.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
   res.json({ source: 'extension', tabs });
 });
 
-// Switch / activate a specific tab (proxied to extension via event bus)
+// Tab groups
+app.get('/groups', async (req, res) => {
+  broadcastToWS({ type: 'list_groups' });
+  res.json({ queued: true });
+});
+
+app.post('/groups', async (req, res) => {
+  const { action, title, color, tabIds, groupId } = req.body || {};
+  if (!action) return json({ error: 'action required' }, 400);
+  broadcastToWS({ type: action, title, color, tabIds, groupId });
+  res.json({ queued: true });
+});
+
+app.get('/sessions', async (req, res) => {
+  broadcastToWS({ type: 'get_all_sessions' });
+  res.json({ queued: true, mode: USE_CDP ? 'cdp' : 'extension' });
+});
+
+app.post('/sessions/:tabId', async (req, res) => {
+  const { tabId } = req.params;
+  broadcastToWS({ type: 'get_session_tokens', tabId: Number(tabId) });
+  res.json({ queued: true });
+});
+
 app.post('/tabs/:tabId/activate', async (req, res) => {
   const { tabId } = req.params;
   broadcastToWS({ type: 'switch_tab', tabId: Number(tabId) });
   res.json({ queued: true, tabId: Number(tabId) });
 });
 
-// Login state detection via extension
 app.post('/tabs/login-states', async (req, res) => {
   broadcastToWS({ type: 'detect_all_login_states' });
-  // Return extension-known states immediately; live updates arrive via WS
   const states = [];
   remoteTabs.forEach((meta, tabId) => states.push({ tabId, ...meta }));
   res.json({ queued: true, states });
 });
 
-// Screenshot
 app.post('/screenshot', async (req, res) => {
   const { url, width, height, fullPage } = req.body || {};
   if (!url) return json({ error: 'url required' }, 400);
@@ -141,7 +157,6 @@ app.post('/screenshot', async (req, res) => {
   }
 });
 
-// Page summary
 app.post('/summarize', async (req, res) => {
   const { url, width } = req.body || {};
   if (!url) return json({ error: 'url required' }, 400);
@@ -174,7 +189,6 @@ app.post('/summarize', async (req, res) => {
   }
 });
 
-// CDP connect
 app.post('/cdp/connect', async (req, res) => {
   const { endpoint } = req.body || {};
   if (!endpoint) return json({ error: 'endpoint required (http://127.0.0.1:9222)' }, 400);
@@ -183,9 +197,7 @@ app.post('/cdp/connect', async (req, res) => {
   return json({ mode: 'cdp', connected: true, targetId: cdpTargetId });
 });
 
-// Control routed by extension (requires extension-connected host)
 app.post('/control', async (req, res) => {
-  // When running headless, use Playwright as before
   const b = browser || (await getBrowser());
   const context = await b.contexts().catch(() => null);
   const pages = context?.pages?.() || [];
@@ -228,41 +240,23 @@ app.post('/control', async (req, res) => {
   }
 });
 
-// Events coming from extension (tab updates, login states)
 app.post('/event', (req, res) => {
   const payload = req.body || {};
-  if (payload.type === 'tab_update' && payload.tabId) {
-    upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: false });
-  }
-  if (payload.type === 'tab_activated' && payload.tabId) {
-    upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: true });
-  }
-  if (payload.type === 'tab_removed' && payload.tabId) {
-    remoteTabs.delete(payload.tabId);
-  }
-  if (payload.type === 'login_state' && payload.tabId) {
-    upsertRemoteTab({ tabId: payload.tabId, loginState: payload.loginState });
-  }
+  if (payload.type === 'tab_update' && payload.tabId) upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: false });
+  if (payload.type === 'tab_activated' && payload.tabId) upsertRemoteTab({ tabId: payload.tabId, url: payload.url, title: payload.title, active: true });
+  if (payload.type === 'tab_removed' && payload.tabId) remoteTabs.delete(payload.tabId);
+  if (payload.type === 'login_state' && payload.tabId) upsertRemoteTab({ tabId: payload.tabId, loginState: payload.loginState });
   const msg = { id: uuidv4(), ...payload, receivedAt: new Date().toISOString() };
   const raw = JSON.stringify(msg);
-  wsClients.forEach((ws) => {
-    if (ws.readyState === 1) ws.send(raw);
-  });
+  wsClients.forEach((ws) => { if (ws.readyState === 1) ws.send(raw); });
   res.status(202).json({ queued: wsClients.size });
 });
 
-// Push commands from bridge to extension via WS
 function broadcastToWS(msg) {
-  const raw = JSON.stringify({ ...msg, _bridge: true });
-  wsClients.forEach((ws) => {
-    if (ws.readyState === 1) ws.send(raw);
-  });
+  wsClients.forEach((ws) => { if (ws.readyState === 1) ws.send(JSON.stringify({ ...msg, _bridge: true })); });
 }
 
-const server = app.listen(PORT, '127.0.0.1', () => {
-  console.log(`[hermes-browser-bridge] HTTP + WS on http://127.0.0.1:${PORT}`);
-});
-
+const server = app.listen(PORT, '127.0.0.1', () => console.log(`[hermes-browser-bridge] HTTP + WS on http://127.0.0.1:${PORT}`));
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (ws) => {
   wsClients.add(ws);
@@ -272,9 +266,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     const msg = raw.toString();
     const id = uuidv4();
-    wsClients.forEach((client) => {
-      if (client !== ws && client.readyState === 1) client.send(JSON.stringify({ id, from: 'ws', body: msg }));
-    });
+    wsClients.forEach((client) => { if (client !== ws && client.readyState === 1) client.send(JSON.stringify({ id, from: 'ws', body: msg })); });
     ws.send(JSON.stringify({ id, ok: true, bytes: Buffer.byteLength(msg) }));
   });
 });

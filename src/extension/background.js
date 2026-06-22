@@ -91,6 +91,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function runCommand(payload, requestId) {
+  if (['list_groups', 'create_group', 'update_group', 'add_to_group', 'remove_from_group', 'delete_group'].includes(payload.action)) {
+    return runGroupCommand(payload);
+  }
+
   // Multi-tab commands go through the active-tab helper, but we also support explicit tabId
   const explicitTabId = payload.tabId;
   const tabs = explicitTabId
@@ -109,6 +113,63 @@ async function runCommand(payload, requestId) {
   }
 
   return payload.allTabs ? { tabs: results } : results[0];
+}
+
+async function runGroupCommand(payload) {
+  switch (payload.action) {
+    case 'list_groups': {
+      const groups = await chrome.tabGroups.query({});
+      const out = [];
+      for (const g of groups) {
+        const tabs = await chrome.tabs.query({ groupId: g.id });
+        out.push({
+          id: g.id,
+          title: g.title,
+          color: g.color,
+          collapsed: g.collapsed,
+          windowId: g.windowId,
+          tabIds: tabs.map(t => t.id)
+        });
+      }
+      return { groups: out };
+    }
+    case 'create_group': {
+      let groupId;
+      if (payload.tabIds && payload.tabIds.length) {
+        groupId = await chrome.tabs.group({ tabIds: payload.tabIds });
+      } else {
+        const tab = await chrome.tabs.create({ url: payload.url || 'about:blank' });
+        groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+      }
+      if (payload.title || payload.color) {
+        await chrome.tabGroups.update(groupId, { title: payload.title || '', color: payload.color || 'grey' });
+      }
+      return { created: true, groupId };
+    }
+    case 'update_group': {
+      const updates = {};
+      if (payload.title != null) updates.title = payload.title;
+      if (payload.color) updates.color = payload.color;
+      if (typeof payload.collapsed === 'boolean') updates.collapsed = payload.collapsed;
+      await chrome.tabGroups.update(payload.groupId, updates);
+      return { updated: true, groupId: payload.groupId };
+    }
+    case 'add_to_group': {
+      await chrome.tabs.group({ tabIds: payload.tabIds, groupId: payload.groupId });
+      return { added: true, groupId: payload.groupId, tabIds: payload.tabIds };
+    }
+    case 'remove_from_group': {
+      await chrome.tabs.ungroup(payload.tabIds);
+      return { removed: true, tabIds: payload.tabIds };
+    }
+    case 'delete_group': {
+      const tabs = await chrome.tabs.query({ groupId: payload.groupId });
+      await chrome.tabs.ungroup(tabs.map(t => t.id));
+      return { deleted: true, groupId: payload.groupId };
+    }
+    default:
+      throw new Error('Unknown group action: ' + payload.action);
+  }
 }
 
 async function runOnTab(tabId, payload) {
@@ -181,6 +242,52 @@ async function runOnTab(tabId, payload) {
         }
       }
       return { detections };
+    }
+    case 'get_session_tokens': {
+      if (!USE_CDP) return { error: 'session_tokens_require_cdp_mode', hint: 'connect with --remote-debugging-port=9222' };
+      const cookies = await cdpSend('Network.getAllCookies');
+      const tab = await chrome.tabs.get(tabId);
+      const hostname = new URL(tab.url).hostname;
+      const relevant = (cookies.cookies || []).filter(c => c.domain.includes(hostname.replace('www.', '')));
+      const authCookies = relevant.filter(c => /session|token|auth|jwt|bearer|access|refresh|id/i.test(c.name));
+      const storageResult = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const s = { ...(window.localStorage || {}), ...(window.sessionStorage || {}) };
+          return Object.entries(s).filter(([k, v]) => /token|access_token|id_token|session|auth|jwt|bearer|refresh/i.test(k) && typeof v === 'string' && v.length > 20).map(([k, v]) => ({ key: k, length: v.length, snippet: v.slice(0, 40) + '...' }));
+        }
+      }).catch(() => []);
+      return {
+        tabId,
+        hostname,
+        cookieCount: relevant.length,
+        authCookieCount: authCookies.length,
+        authCookies: authCookies.map(c => ({ name: c.name, domain: c.domain, httpOnly: c.httpOnly, secure: c.secure })),
+        storageTokenCount: (storageResult && storageResult[0]?.result)?.length || 0,
+        storageTokens: storageResult && storageResult[0]?.result ? storageResult[0].result : [],
+      };
+    }
+    case 'get_all_sessions': {
+      if (!USE_CDP) return { error: 'all_sessions_require_cdp_mode' };
+      const cookies = await cdpSend('Network.getAllCookies');
+      const domains = new Set();
+      (cookies.cookies || []).forEach(c => domains.add(c.domain));
+      const sessions = [];
+      for (const domain of domains) {
+        const domainCookies = (cookies.cookies || []).filter(c => c.domain === domain);
+        const authCookies = domainCookies.filter(c => /session|token|auth|jwt|bearer|access|refresh|sid|ssid|csrftoken/i.test(c.name));
+        if (authCookies.length > 0) {
+          sessions.push({
+            domain,
+            url: `https://${domain}`,
+            cookieCount: domainCookies.length,
+            authCookieCount: authCookies.length,
+            authCookieNames: authCookies.map(c => c.name),
+            hasHttpOnly: authCookies.some(c => c.httpOnly),
+          });
+        }
+      }
+      return { mode: 'cdp', sessions, totalDomains: domains.size };
     }
     case 'get_url':
       return { url: (await chrome.tabs.get(tabId)).url };
