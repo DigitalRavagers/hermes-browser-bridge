@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hermes Browser Bridge</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; margin: 0; background: #0b1020; color: #e5e7eb; }
+    header { padding: 14px 18px; border-bottom: 1px solid #1f2937; display: flex; align-items: center; gap: 10px; }
+    header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+    .badge { font-size: 10px; padding: 2px 6px; border-radius: 999px; background: #14b8a6; color: #fff; }
+    main { padding: 18px; display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    section { border: 1px solid #1f2937; border-radius: 10px; padding: 14px; background: #0f1525; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #9ca3af; margin: 0 0 10px; }
+    label { display: block; font-size: 12px; color: #9ca3af; margin: 6px 0 4px; }
+    input, select, button, textarea { font: inherit; color: inherit; background: #0b1020; border: 1px solid #1f2937; border-radius: 8px; padding: 8px 10px; width: 100%; }
+    textarea { min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; font-size: 12px; }
+    button { background: #111827; cursor: pointer; }
+    button:hover { background: #111827f0; }
+    button.primary { background: #16a34a; border-color: #16a34a; color: #fff; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .status { font-size: 12px; color: #14b8a6; }
+    .err { color: #f87171; }
+    .img { max-width: 100%; border-radius: 8px; border: 1px solid #1f2937; background: #000; }
+    details { border: 1px solid #1f2937; border-radius: 8px; padding: 10px; }
+    summary { color: #e5e7eb; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Hermes Browser Bridge</h1>
+    <span class="badge">v0.1</span>
+    <span id="status" class="status">connecting…</span>
+  </header>
+  <main>
+    <section>
+      <h2>Visibility</h2>
+      <label>URL</label>
+      <input id="url" type="url" value="https://example.com" />
+      <div class="row">
+        <button id="btnScreenshot" class="primary">Screenshot</button>
+        <button id="btnSummarize">Summarize</button>
+      </div>
+      <div style="margin-top:10px; min-height: 140px; border:1px dashed #1f2937; border-radius:8px; padding:8px;">
+        <img id="preview" class="img" style="display:none" alt="preview" />
+        <div id="previewText" style="color:#6b7280; font-size:12px; padding:6px;">Screenshot will appear here.</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Agent control</h2>
+      <label>Action</label>
+      <select id="action">
+        <option value="click">Click</option>
+        <option value="type">Type</option>
+        <option value="screenshot">Screenshot (renderer)</option>
+        <option value="evaluate">Evaluate JS</option>
+        <option value="scroll">Scroll</option>
+      </select>
+      <label>Selector / expression</label>
+      <input id="selector" placeholder="a[href], body, #app" />
+      <label>Value (for type/text)</label>
+      <input id="value" placeholder="hello world or button=yes" />
+      <button id="btnRun">Run</button>
+      <pre id="result" style="background:#0b1020; padding:8px; border-radius:8px; overflow:auto; max-height:220px; font-size:12px; color:#c7d2fe;"></pre>
+    </section>
+
+    <section style="grid-column: 1 / -1;">
+      <h2>Console</h2>
+      <textarea id="log" readonly style="min-height: 180px;"></textarea>
+    </section>
+  </main>
+
+  <script>
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const log = (m) => {
+      const t = document.getElementById('log');
+      t.value += `\n[${new Date().toISOString()}] ${JSON.stringify(m)}\n`;
+      t.scrollTop = t.scrollHeight;
+    };
+    ws.addEventListener('open', () => {
+      document.getElementById('status').className = 'status';
+      document.getElementById('status').textContent = 'connected';
+      log({ type: 'connected' });
+    });
+    ws.addEventListener('message', (e) => log(JSON.parse(e.data)));
+    ws.addEventListener('close', () => {
+      document.getElementById('status').className = 'status err';
+      document.getElementById('status').textContent = 'disconnected';
+    });
+
+    async function api(path, body) {
+      const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      return r.status === 204 ? null : r.json();
+    }
+
+    document.getElementById('btnScreenshot').addEventListener('click', async () => {
+      const data = await api('/screenshot', { url: document.getElementById('url').value, width: 1280, height: 800 });
+      if (data?.dataUrl) {
+        const img = document.getElementById('preview');
+        img.src = data.dataUrl;
+        img.style.display = 'block';
+        document.getElementById('previewText').style.display = 'none';
+      } else {
+        document.getElementById('previewText').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('previewText').style.display = 'block';
+        document.getElementById('preview').style.display = 'none';
+      }
+      log({ type: 'screenshot', size: data?.dataUrl?.length });
+    });
+
+    document.getElementById('btnSummarize').addEventListener('click', async () => {
+      const data = await api('/summarize', { url: document.getElementById('url').value });
+      document.getElementById('previewText').textContent = JSON.stringify(data, null, 2);
+      document.getElementById('previewText').style.display = 'block';
+      document.getElementById('preview').style.display = 'none';
+      log({ type: 'summarize' });
+    });
+
+    document.getElementById('btnRun').addEventListener('click', async () => {
+      const action = document.getElementById('action').value;
+      const selector = document.getElementById('selector').value;
+      const value = document.getElementById('value').value;
+      const payload = { action };
+      if (['click', 'type'].includes(action)) payload.selector = selector;
+      if (action === 'type') payload.text = value;
+      if (action === 'evaluate') { payload.fn = selector; payload.args = []; }
+      if (action === 'scroll') { payload.x = 0; payload.y = 300; }
+      const data = await api('/control', payload);
+      document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+      log({ type: 'control', payload, data });
+    });
+  </script>
+</body>
+</html>
