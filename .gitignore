@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+*.pyc
+__pycache__/
+.env
+.nyc_output
+coverage/
+.DS_Store

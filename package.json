@@ -4,13 +4,17 @@
   "description": "Chrome extension + local bridge that lets any agent see and drive your browser",
   "scripts": {
     "dev": "node src/bridge/index.js",
-    "install-extension": "node scripts/install-extension.js"
+    "install-extension": "node scripts/install-extension.js",
+    "tray": "electron src/desktop-tray/main.js",
+    "test:bridge": "node -e 'const http=require(\"http\");const data=JSON.stringify({url:\"https://example.com\",width:1280,height:800});const req=http.request({hostname:\"127.0.0.1\",port:8765,path:\"/screenshot\",method:\"POST\",headers:{\"Content-Type\":\"application/json\",\"Content-Length\":Buffer.byteLength(data)}},res=>{let b=\"\";res.on(\"data\",c=>b+=c);res.on(\"end\",()=>console.log(b.slice(0,120)))});req.write(data);req.end()'"
   },
   "dependencies": {
     "express": "^4.21.0",
     "ws": "^8.18.0",
-    "puppeteer-core": "^22.0.0",
     "playwright": "^1.47.0",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0"
   }
 }

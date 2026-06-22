@@ -1,0 +1,9 @@
+{
+  "name": "com.digitalravagers.hermes.browser",
+  "description": "Native messaging host for Hermes Browser Bridge",
+  "path": "native-host.js",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__MSG_APP_ID__/"
+  ]
+}

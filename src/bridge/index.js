@@ -9,7 +9,11 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'pages')));
 
-let browser = null;
+const CDP_ENDPOINT = process.env.CDP_ENDPOINT || null;
+const USE_CDP = !!CDP_ENDPOINT;
+
+let cdpClient = null;
+let cdpTargetId = null;
 let wsClients = new Set();
 
 async function getBrowser() {
@@ -18,7 +22,64 @@ async function getBrowser() {
   return browser;
 }
 
+async function getCDP() {
+  if (!USE_CDP) return null;
+  if (cdpClient && cdpClient.connected) return cdpClient;
+  const wsEndpoint = new URL(CDP_ENDPOINT).toString().replace(/^http/, 'ws') + '/json/version';
+  const ws = new (require('ws'))(wsEndpoint);
+  await new Promise((resolve, reject) => {
+    ws.on('open', resolve);
+    ws.on('error', reject);
+    setTimeout(() => reject(new Error('CDP connect timeout')), 15000);
+  });
+  // Try to fetch target list
+  const http = require('http');
+  const targets = await new Promise((resolve, reject) => {
+    http.get(new URL('/json/list', CDP_ENDPOINT).toString(), (res) => {
+      let body = '';
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => resolve(JSON.parse(body)));
+    }).on('error', reject);
+  });
+  const page = targets.find(t => t.type === 'page') || targets[0];
+  if (!page) throw new Error('No CDP target found. Launch Chrome with --remote-debugging-port=9222');
+  cdpTargetId = page.id;
+  const wsUrl = page.webSocketDebuggerUrl || new URL('/devtools/page/' + page.id, CDP_ENDPOINT).toString().replace(/^http/, 'ws');
+  cdpClient = new (require('ws'))(wsUrl);
+  await new Promise((resolve, reject) => {
+    cdpClient.on('open', resolve);
+    cdpClient.on('error', reject);
+    setTimeout(() => reject(new Error('CDP ws timeout')), 15000);
+  });
+  return cdpClient;
+}
+
+async function cdpSend(method, params = {}) {
+  const client = await getCDP();
+  const id = 1;
+  return new Promise((resolve, reject) => {
+    const handler = (raw) => {
+      const msg = JSON.parse(raw.toString());
+      if (msg.id === id) {
+        client.off('message', handler);
+        if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        else resolve(msg.result);
+      }
+    };
+    client.on('message', handler);
+    client.send(JSON.stringify({ id, method, params }));
+    setTimeout(() => { client.off('message', handler); reject(new Error('cdp timeout: ' + method)); }, 20000);
+  });
+}
 async function renderPage({ url, width = 1280, height = 800, fullPage = false }) {
+  if (USE_CDP) {
+    const client = await getCDP();
+    await cdpSend('Page.navigate', { url });
+    await new Promise(r => setTimeout(r, 1500));
+    const clip = fullPage ? null : { x: 0, y: 0, width, height, scale: 1 };
+    const { data } = await cdpSend('Page.captureScreenshot', { format: 'png', clip });
+    return data; // base64 string
+  }
   const b = await getBrowser();
   const page = await b.newPage({ viewport: { width, height } });
   await page.setExtraHTTPHeaders({ 'user-agent': 'Mozilla/5.0 (compatible; Hermes Browser Bridge)' });
@@ -59,6 +120,16 @@ app.post('/summarize', async (req, res) => {
   const { url, width } = req.body || {};
   if (!url) return json({ error: 'url required' }, 400);
   try {
+    if (USE_CDP) {
+      const client = await getCDP();
+      await cdpSend('Page.navigate', { url: String(url) });
+      await new Promise(r => setTimeout(r, 1500));
+      const { root } = await cdpSend('DOM.getDocument', { depth: 2 });
+      const { outerHTML } = await cdpSend('DOM.getOuterHTML', { nodeId: root.nodeId });
+      const js = `(() => ({ title: document.title, url: document.location.href, text: document.body?.innerText?.slice(0, 4000), links: Array.from(document.querySelectorAll('a')).slice(0, 40).map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.getAttribute('href') })) }))()`;
+      const { result } = await cdpSend('Runtime.evaluate', { expression: js, returnByValue: true });
+      return json(result.value);
+    }
     const b = await getBrowser();
     const page = await b.newPage({ viewport: { width: width || 1280, height: 900 } });
     await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -80,9 +151,18 @@ app.post('/summarize', async (req, res) => {
 });
 
 // Lightweight browser control – sends simulated input to the local Chromium instance
+// Connect to an existing Chrome via CDP and start proxying agent control to it.
+app.post('/cdp/connect', async (req, res) => {
+  const { endpoint } = req.body || {};
+  if (!endpoint) return json({ error: 'endpoint required (http://127.0.0.1:9222)' }, 400);
+  process.env.CDP_ENDPOINT = String(endpoint);
+  try { cdpClient = null; await getCDP(); } catch (e) { return json({ error: String(e) }, 500); }
+  return json({ mode: 'cdp', connected: true, targetId: cdpTargetId });
+});
+
 app.post('/control', async (req, res) => {
   const { action, selector, url, text, x, y } = req.body || {};
-  const b = await getBrowser();
+  const b = browser || (await getBrowser());
   const context = await b.contexts().catch(() => null);
   const pages = context?.pages?.() || [];
   // Prefer a visible tab when available, else create one
