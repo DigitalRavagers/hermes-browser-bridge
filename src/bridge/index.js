@@ -80,11 +80,11 @@ async function cdpSend(method, params = {}) {
   });
 }
 
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+function json(res, obj, status = 200) {
+  return res.status(status).json(obj);
 }
 
-app.get('/health', async () => json({ ok: true, service: 'hermes-browser-bridge', time: new Date().toISOString() }));
+app.get('/health', (req, res) => json(res, { ok: true, service: 'hermes-browser-bridge', time: new Date().toISOString() }));
 
 app.get('/tabs', async (req, res) => {
   const useExtension = req.query.source !== 'cdp';
@@ -117,7 +117,7 @@ app.get('/groups', async (req, res) => {
 
 app.post('/groups', async (req, res) => {
   const { action, title, color, tabIds, groupId } = req.body || {};
-  if (!action) return json({ error: 'action required' }, 400);
+  if (!action) return json(res, { error: 'action required' }, 400);
   broadcastToWS({ type: action, title, color, tabIds, groupId });
   res.json({ queued: true });
 });
@@ -148,18 +148,18 @@ app.post('/tabs/login-states', async (req, res) => {
 
 app.post('/screenshot', async (req, res) => {
   const { url, width, height, fullPage } = req.body || {};
-  if (!url) return json({ error: 'url required' }, 400);
+  if (!url) return json(res, { error: 'url required' }, 400);
   try {
     const base64 = await renderPage({ url: String(url), width: width || 1280, height: height || 800, fullPage: fullPage || false });
-    return json({ dataUrl: `data:image/png;base64,${base64}`, url, width, height });
+    return json(res, { dataUrl: `data:image/png;base64,${base64}`, url, width, height });
   } catch (e) {
-    return json({ error: String(e) }, 500);
+    return json(res, { error: String(e) }, 500);
   }
 });
 
 app.post('/summarize', async (req, res) => {
   const { url, width } = req.body || {};
-  if (!url) return json({ error: 'url required' }, 400);
+  if (!url) return json(res, { error: 'url required' }, 400);
   try {
     if (USE_CDP) {
       const client = await getCDP();
@@ -167,7 +167,7 @@ app.post('/summarize', async (req, res) => {
       await new Promise(r => setTimeout(r, 1500));
       const js = `(() => ({ title: document.title, url: document.location.href, text: document.body?.innerText?.slice(0, 4000), links: Array.from(document.querySelectorAll('a')).slice(0, 40).map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.getAttribute('href') })) }))()`;
       const { result } = await cdpSend('Runtime.evaluate', { expression: js, returnByValue: true });
-      return json(result.value);
+      return json(res, result.value);
     }
     const b = await getBrowser();
     const page = await b.newPage({ viewport: { width: width || 1280, height: 900 } });
@@ -183,18 +183,18 @@ app.post('/summarize', async (req, res) => {
       }))
     }));
     await page.close();
-    return json(data);
+    return json(res, data);
   } catch (e) {
-    return json({ error: String(e) }, 500);
+    return json(res, { error: String(e) }, 500);
   }
 });
 
 app.post('/cdp/connect', async (req, res) => {
   const { endpoint } = req.body || {};
-  if (!endpoint) return json({ error: 'endpoint required (http://127.0.0.1:9222)' }, 400);
+  if (!endpoint) return json(res, { error: 'endpoint required (http://127.0.0.1:9222)' }, 400);
   process.env.CDP_ENDPOINT = String(endpoint);
-  try { cdpClient = null; await getCDP(); } catch (e) { return json({ error: String(e) }, 500); }
-  return json({ mode: 'cdp', connected: true, targetId: cdpTargetId });
+  try { cdpClient = null; await getCDP(); } catch (e) { return json(res, { error: String(e) }, 500); }
+  return json(res, { mode: 'cdp', connected: true, targetId: cdpTargetId });
 });
 
 app.post('/control', async (req, res) => {
@@ -211,32 +211,32 @@ app.post('/control', async (req, res) => {
   try {
     if (action === 'screenshot') {
       const buf = await page.screenshot({ type: 'png' });
-      return json({ dataUrl: `data:image/png;base64,${buf.toString('base64')}` });
+      return json(res, { dataUrl: `data:image/png;base64,${buf.toString('base64')}` });
     }
     if (action === 'evaluate') {
       const { fn, args } = req.body || {};
       const result = await page.evaluate((f, a) => {
         try { return { ok: true, value: f(...a) }; } catch (e) { return { ok: false, error: String(e) }; }
       }, fn, args || []);
-      return json(result);
+      return json(res, result);
     }
     if (action === 'click' && selector) {
       await page.click(selector);
       await page.waitForTimeout(250);
-      return json({ clicked: true, selector });
+      return json(res, { clicked: true, selector });
     }
     if (action === 'type' && selector && typeof text === 'string') {
       await page.fill(selector, text);
       await page.waitForTimeout(100);
-      return json({ typed: true, selector });
+      return json(res, { typed: true, selector });
     }
     if (action === 'scroll' && (x != null || y != null)) {
       await page.evaluate((x, y) => window.scrollTo(x, y), x ?? 0, y ?? 0);
-      return json({ scrolled: true, x, y });
+      return json(res, { scrolled: true, x, y });
     }
-    return json({ error: 'Unsupported control action' }, 400);
+    return json(res, { error: 'Unsupported control action' }, 400);
   } catch (e) {
-    return json({ error: String(e) }, 500);
+    return json(res, { error: String(e) }, 500);
   }
 });
 
